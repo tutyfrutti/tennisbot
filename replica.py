@@ -1,11 +1,13 @@
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
+from pyrogram.types import CallbackQuery
 import sqlite3
 import os
 import aiosqlite
 import logging
+from pyrogram.types import Message
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging. INFO)
 
 
 # Введи свои данные API
@@ -21,10 +23,18 @@ os.makedirs(image_dir, exist_ok=True)
 # Инициализация клиента
 app = Client("tennis_club_bot", api_id=api_id, api_hash=api_hash, bot_token=bot_token)
 
+
 # Словарь для хранения данных о добавлении турнира
 tournament_data = {}
 # Словарь для хранения данных о добавлении игрока
 player_data = {}
+
+
+async def fetch_player_by_id(player_id):
+    async with aiosqlite.connect('tennis_club.db') as db:
+        async with db.execute('SELECT first_name, last_name, rating FROM players WHERE id = ?', (player_id,)) as cursor:
+            player = await cursor.fetchone()
+    return player
 
 
 async def fetch_players():
@@ -33,6 +43,12 @@ async def fetch_players():
         async with db.execute('SELECT id, first_name, last_name, rating FROM players ORDER BY rating DESC') as cursor:
             players = await cursor.fetchall()
     return players
+
+
+async def delete_all_tournament_images(tournament_id):
+    async with aiosqlite.connect('tennis_club.db') as db:
+        await db.execute('DELETE FROM tournament_images WHERE tournament_id = ?', (tournament_id,))
+        await db.commit()
 
 
 def get_tournaments():
@@ -72,36 +88,41 @@ def save_tournament(name, date, location, prize_pool, participants_count, status
 def update_tournament_image(tournament_id, image_path):
     conn = sqlite3.connect('tennis_club.db')
     cursor = conn.cursor()
-    cursor.execute('UPDATE tournaments SET image_path = ? WHERE id = ?', (image_path, tournament_id))
+    cursor.execute('''INSERT INTO tournament_images (tournament_id, image_path)
+                      VALUES (?, ?)''', (tournament_id, image_path))
     conn.commit()
     conn.close()
 
+async def fetch_tournament_images(tournament_id):
+    async with aiosqlite.connect('tennis_club.db') as db:
+        async with db.execute('SELECT image_path FROM tournament_images WHERE tournament_id = ?', (tournament_id,)) as cursor:
+            images = await cursor.fetchall()
+    return [image[0] for image in images]  # Возвращаем только пути изображений
+
 
 async def add_player(first_name, last_name, rating):
-    # Добавляем нового игрока в базу данных с автоматическим присвоением ID
     async with aiosqlite.connect('tennis_club.db') as db:
+        # Получаем максимальный ID из таблицы игроков
+        async with db.execute("SELECT MAX(id) FROM players") as cursor:
+            max_id = await cursor.fetchone()
+            next_id = (max_id[0] + 1) if max_id[0] is not None else 1  # Если таблица пуста, начинаем с 1
+
+        # Добавляем нового игрока в базу данных с автоматическим присвоением ID
         await db.execute(
-            'INSERT INTO players (first_name, last_name, rating) VALUES (?, ?, ?)',
-            (first_name, last_name, int(rating))  # Преобразуем рейтинг в int
+            'INSERT INTO players (id, first_name, last_name, rating) VALUES (?, ?, ?, ?)',
+            (next_id, first_name, last_name,  int(rating))  # Преобразуем рейтинг в int
         )
         await db.commit()
 
 
-async def get_player(db, first_name: str, surname: str):
-    async with db.execute("SELECT * FROM players WHERE first_name = ? AND last_name = ?",
-                          (first_name, surname)) as cursor:
-        return await cursor.fetchone()
+def get_players():
+    conn = sqlite3.connect('tennis_club.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, first_name, last_name, rating FROM players ORDER BY rating DESC")
+    players = cursor.fetchall()
+    conn.close()
+    return players
 
-
-async def delete_player_from_db(first_name: str, last_name: str):
-    async with aiosqlite.connect('tennis_club.db') as db:
-        player = await get_player(db, first_name, last_name)
-
-        if player:
-            await db.execute("DELETE FROM players WHERE first_name = ? AND last_name = ?", (first_name, last_name))
-            await db.commit()
-            return True  # Успешно удалено
-        return False  # Игрок не найден
 
 
 # Функция для записи запроса на регистрацию в турнир
@@ -202,192 +223,347 @@ async def handle_callback_query(client, callback_query):
     if tournament[7].strip() == "active":
         keyboard.append([InlineKeyboardButton("Зарегистрироваться", callback_data=f"register_{tournament_id}")])
 
-    # Кнопки для администратора
-    if callback_query.from_user.id == ADMIN_USER_ID:  # Проверяем, является ли пользователь администратором
+    # Проверка, является ли пользователь администратором
+    if callback_query.from_user.id == ADMIN_USER_ID:
+        print(f"Пользователь {callback_query.from_user.id} является администратором.")
         keyboard.append([
             InlineKeyboardButton("Сменить статус", callback_data=f"change_status_{tournament_id}"),
-            InlineKeyboardButton("Удалить турнир", callback_data=f"delete_{tournament_id}")
+            InlineKeyboardButton("Удалить турнир", callback_data=f"delete_{tournament_id}"),
+            InlineKeyboardButton("Удалить фото", callback_data=f"delete_all_photos_{tournament_id}")  # Новая кнопка
         ])
+    else:
+        print(f"Пользователь {callback_query.from_user.id} не администратор. Кнопки администратора не будут добавлены.")
 
+    # Если кнопок нет, устанавливаем reply_markup в None
     reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
 
     try:
         # Обновляем сообщение
         await callback_query.message.edit_text(response, reply_markup=reply_markup)
+
+        # Получаем и отправляем все изображения турнира
+        images = await fetch_tournament_images(tournament_id)
+        for image_path in images:
+            await callback_query.message.reply_photo(photo=image_path)
+
     except Exception as e:
-        print(f"Error updating message: {e}")  # Можно добавить логирование
+        await callback_query.message.reply_text("❗ Произошла ошибка при обновлении сообщения.")
+
+    await callback_query.answer()
 
 
-@app.on_callback_query(filters.regex(r"^delete_\d+$"))
-async def delete_tournament(client, callback_query):
+@app.on_callback_query(filters.regex(r"^delete_all_photos_\d+$"))
+async def handle_delete_all_photos(client, callback_query):
+    tournament_id = int(callback_query.data.split("_")[3])  # Получаем ID турнира
+
+    await delete_all_tournament_images(tournament_id)  # Удаляем все изображения
+
+    await callback_query.message.reply_text("✅ Все фотографии турнира успешно удалены.")
+    await callback_query.answer()
+
+
+# Словарь для временного хранения состояний пользователей
+user_states = {}
+
+
+@app.on_callback_query(filters.regex(r"^register_\d+$"))
+async def register_for_tournament(client, callback_query):
     tournament_id = int(callback_query.data.split("_")[1])
+    user_id = callback_query.from_user.id
+    username = callback_query.from_user.username
 
-    # Удаляем турнир из базы данных
+    # Проверка, не зарегистрирован ли пользователь ранее
+    requests = get_tournament_requests(tournament_id)
+    if any(req[0] == username for req in requests):
+        await callback_query.answer("Вы уже зарегистрировались на этот турнир.", show_alert=True)
+        return
+
+    # Запрашиваем имя и фамилию у пользователя
+    user_states[user_id] = {"tournament_id": tournament_id, "username": username}
+    await callback_query.message.reply_text("Пожалуйста, введите ваше имя и фамилию:",
+                                            reply_markup=ForceReply(selective=True))
+    await callback_query.answer()
+
+
+@app.on_message(filters.text & filters.reply)
+async def handle_name_surname(client, message):
+    user_id = message.from_user.id
+    full_name = message.text.strip()
+
+    # Проверяем, есть ли состояние для пользователя
+    if user_id in user_states:
+        tournament_id = user_states[user_id]["tournament_id"]
+        username = user_states[user_id]["username"]
+
+        # Добавляем запрос на регистрацию в базу данных
+        add_tournament_request(tournament_id, user_id, username, full_name)
+
+        await message.reply_text("Вы успешно зарегистрировались на турнир!")
+
+        # Очищаем состояние пользователя
+        del user_states[user_id]
+    else:
+        await message.reply_text("Произошла ошибка. Попробуйте еще раз.")
+
+
+
+@app.on_callback_query(filters.regex(r"^delete_\d+$") & filters.user(ADMIN_USER_ID))
+async def delete_tournament_callback(client, callback_query):
+    tournament_id = int(callback_query.data.split("_")[1])
     conn = sqlite3.connect('tennis_club.db')
     cursor = conn.cursor()
     cursor.execute("DELETE FROM tournaments WHERE id = ?", (tournament_id,))
     conn.commit()
+    cursor.execute("DELETE FROM tournament_requests WHERE tournament_id = ?", (tournament_id,))
+    conn.commit()
     conn.close()
 
-    await callback_query.message.reply_text("✅ Турнир успешно удалён.")
-    await show_tournaments(client, callback_query.message)
+    await callback_query.answer("Турнир успешно удален.", show_alert=True)
+    await callback_query.message.delete()
 
 
-@app.on_callback_query(filters.regex(r"^change_status_\d+$"))
-async def change_status(client, callback_query):
-    tournament_id = int(callback_query.data.split("_")[2])
-    tournament = get_tournament_by_id(tournament_id)
+@app.on_callback_query(filters.regex(r"^change_status_\d+$") & filters.user(ADMIN_USER_ID))
+async def change_status_callback(client, callback_query):
+    try:
+        # Извлекаем ID турнира из callback_data
+        tournament_id = int(
+            callback_query.data.split("_")[2])  # Исправлено на 2, если используется 'change_status_{id}'
 
-    if tournament:
-        new_status = 'finished' if tournament[7].strip() == 'active' else 'active'
+        # Получаем информацию о турнире
+        tournament = get_tournament_by_id(tournament_id)
+
+        if tournament is None:
+            await callback_query.answer("Турнир не найден.", show_alert=True)
+            return
+
+        # Определяем новый статус турнира
+        new_status = "finished" if tournament[7].strip() == "active" else "active"
+
+        # Обновляем статус в базе данных
         conn = sqlite3.connect('tennis_club.db')
         cursor = conn.cursor()
-        cursor.execute("UPDATE tournaments SET status = ? WHERE id = ?", (new_status, tournament_id))
+        cursor.execute('UPDATE tournaments SET status = ? WHERE id = ?', (new_status, tournament_id))
         conn.commit()
         conn.close()
 
-        await callback_query.message.reply_text(
-            f"Вы уверены, что хотите удалить игрока {first_name} {last_name}?",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Удалить", callback_data=f"confirm_delete_{first_name}_{last_name}")],
-                [InlineKeyboardButton("Отмена", callback_data="cancel_delete")]
-            ])
-        )
+        await callback_query.answer(
+            f"Статус турнира изменен на {'Завершен' if new_status == 'finished' else 'Активный'}.", show_alert=True)
+        await callback_query.message.delete()
 
-@app.on_callback_query(filters.regex(r"^delete_player_\d+$"))
-async def handle_delete_player(client, callback_query):
-    player_index = int(callback_query.data.split("_")[2]) - 1
-    players = await fetch_players()
-
-    # Логируем получение игроков
-    logging.info(f"Полученные игроки: {players}")
-
-    if player_index < 0 or player_index >= len(players):
-        await callback_query.answer("Игрок не найден.")
-        return
-
-    player = players[player_index]
-    first_name = player[1]
-    last_name = player[2]
-
-    # Логируем запрос на удаление игрока
-    logging.info(f"Запрос на удаление игрока: {first_name} {last_name}")
-
-    await callback_query.message.reply_text(
-        f"Вы уверены, что хотите удалить игрока {first_name} {last_name}?",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("Да", callback_data=f"confirm_delete_{first_name}_{last_name}")],
-            [InlineKeyboardButton("Нет", callback_data="cancel_delete")]
-        ])
-    )
-
-
-@app.on_callback_query(filters.regex(r"^confirm_delete_"))
-async def confirm_delete_player(client, callback_query):
-    data = callback_query.data.split("_")
-    first_name = data[2]
-    last_name = data[3]
-
-    # Логируем подтверждение удаления игрока
-    logging.info(f"Подтверждено удаление игрока: {first_name} {last_name}")
-
-    # Удаляем игрока из базы данных
-    deleted = await delete_player_from_db(first_name, last_name)
-
-    if deleted:
-        await callback_query.message.reply_text(f"✅ Игрок {first_name} {last_name} успешно удален.")
-    else:
-        await callback_query.message.reply_text(f"❌ Игрок {first_name} {last_name} не найден.")
-
-    # Обновляем список игроков
-    await show_players(client, callback_query.message)
-
-@app.on_callback_query(filters.regex(r"^confirm_delete_"))
-async def confirm_delete_player(client, callback_query):
-    data = callback_query.data.split("_")
-    first_name = data[2]
-    last_name = data[3]
-
-    # Логируем подтверждение удаления игрока
-    print(f"Подтверждено удаление игрока: {first_name} {last_name}")  # Добавляем лог
-
-    # Удаляем игрока из базы данных
-    deleted = await delete_player_from_db(first_name, last_name)
-
-    if deleted:
-        await callback_query.message.reply_text(f"✅ Игрок {first_name} {last_name} успешно удален.")
-    else:
-        await callback_query.message.reply_text(f"❌ Игрок {first_name} {last_name} не найден.")
-
-    # Обновляем список игроков
-    await show_players(client, callback_query.message)
-
-
-@app.on_message(filters.command("register"))
-async def register_player(client, message):
-    if message.from_user.id == ADMIN_USER_ID:
-        await message.reply_text("❗️ Администраторы не могут регистрироваться на турниры.")
-        return
-
-    # Логика регистрации игрока
+    except (IndexError, ValueError):
+        await callback_query.answer("Произошла ошибка при изменении статуса турнира.", show_alert=True)
+    except Exception as e:
+        await callback_query.answer("Произошла ошибка. Попробуйте снова.", show_alert=True)
+        print(f"Ошибка: {e}")  # Логируем ошибку для отладки
 
 
 @app.on_message(filters.command("players"))
-async def show_players(client, message):
+async def display_players(client, message):
     players = await fetch_players()
-    response = "🏅 **Список игроков:**\n\n"
-    keyboard = []
 
+    # Формируем сообщение с рейтингом игроков
+    response = "👥 Рейтинг игроков:\n"
     for index, player in enumerate(players, start=1):
-        response += f"{index}. {player[1]} {player[2]} - Рейтинг: {player[3]}\n"
-        keyboard.append([InlineKeyboardButton("Удалить", callback_data=f"delete_player_{index}")])  # Добавляем кнопку удаления
+        response += f"{index} - {player[1]} {player[2]} - Рейтинг: {player[3]}\n"
 
-    await message.reply_text(response, reply_markup=InlineKeyboardMarkup(keyboard))
+    # Создаем кнопки для админа
+    admin_buttons = [
+        [InlineKeyboardButton("Удалить участника", callback_data="delete_player")],
+        [InlineKeyboardButton("Изменить рейтинг", callback_data="change_rating")]
+    ]
+    reply_markup = InlineKeyboardMarkup(admin_buttons)
+
+    # Отправляем сообщение с результатом и кнопками
+    await message.reply_text(response, reply_markup=reply_markup)
 
 
+@app.on_message(filters.command("admin_menu") & filters.user(ADMIN_USER_ID))
+async def admin_menu(client, message):
+    keyboard = [
+        [InlineKeyboardButton("Добавить турнир", callback_data='add_tournament')],
+        [InlineKeyboardButton("Добавить игрока", callback_data='add_player')]  # Добавляем кнопку для добавления игрока
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await message.reply_text('Админ-меню:', reply_markup=reply_markup)
+
+
+@app.on_callback_query(filters.regex(r"^add_player$") & filters.user(ADMIN_USER_ID))
+async def add_player_callback(client, callback_query):
+    await callback_query.message.reply_text("🔍 Введите имя игрока:")
+    player_data[callback_query.from_user.id] = {'step': 'first_name'}
+    await callback_query.answer()  # Отвечаем на callback query
+
+
+@app.on_callback_query(filters.regex(r"^add_tournament$") & filters.user(ADMIN_USER_ID))
+async def add_tournament_callback(client, callback_query):
+    # Запрашиваем название турнира
+    await callback_query.message.reply_text("🔍 Введите название турнира:")
+    tournament_data[callback_query.from_user.id] = {'step': 'name'}
+    await callback_query.answer()  # Отвечаем на callback query
+
+
+@app.on_message(filters.command("add_tournament"))
+async def add_tournament_command(client, message):
+    await message.reply_text("🔍 Введите название турнира:")
+    tournament_data[message.from_user.id] = {'step': 'name'}
 
 @app.on_message(filters.command("add_player"))
 async def add_player_command(client, message):
-    # Логика для добавления игрока
-    await message.reply_text("⚠️ Введите имя игрока, фамилию и рейтинг в формате: 'Имя Фамилия Рейтинг'.")
+    await message.reply_text("🔍 Введите имя игрока:")
+    player_data[message.from_user.id] = {'step': 'first_name'}
+
+@app.on_message(filters.text & filters.user(ADMIN_USER_ID))
+async def handle_input(client, message):
+    user_id = message.from_user.id
+
+    # Обработка добавления турнира
+    if user_id in tournament_data:
+        step = tournament_data[user_id]['step']
+
+        if step == 'name':
+            tournament_data[user_id]['name'] = message.text
+            tournament_data[user_id]['step'] = 'date'
+            await message.reply_text("🔍 Введите дату турнира (YYYY-MM-DD):")
+
+        elif step == 'date':
+            tournament_data[user_id]['date'] = message.text
+            tournament_data[user_id]['step'] = 'location'
+            await message.reply_text("🔍 Введите место турнира:")
+
+        elif step == 'location':
+            tournament_data[user_id]['location'] = message.text
+            tournament_data[user_id]['step'] = 'prize_pool'
+            await message.reply_text("🔍 Введите призовой фонд:")
+
+        elif step == 'prize_pool':
+            tournament_data[user_id]['prize_pool'] = message.text
+            tournament_data[user_id]['step'] = 'participants_count'
+            await message.reply_text("🔍 Введите количество участников:")
+
+        elif step == 'participants_count':
+            tournament_data[user_id]['participants_count'] = message.text
+
+            # Сохранение турнира в базе данных
+            save_tournament(
+                tournament_data[user_id]['name'],
+                tournament_data[user_id]['date'],
+                tournament_data[user_id]['location'],
+                tournament_data[user_id]['prize_pool'],
+                tournament_data[user_id]['participants_count']
+            )
+            await message.reply_text("✅ Турнир успешно добавлен!")
+            del tournament_data[user_id]
+
+    # Обработка добавления игрока
+    elif user_id in player_data:
+        step = player_data[user_id]['step']
+
+        if step == 'first_name':
+            player_data[user_id]['first_name'] = message.text
+            player_data[user_id]['step'] = 'last_name'
+            await message.reply_text("🔍 Введите фамилию игрока:")
+
+        elif step == 'last_name':
+            player_data[user_id]['last_name'] = message.text
+            player_data[user_id]['step'] = 'rating'
+            await message.reply_text("🔍 Введите рейтинг игрока:")
+
+        elif step == 'rating':
+            player_data[user_id]['rating'] = message.text
+
+            # Сохранение игрока в базе данных
+            await add_player(  # Добавлено await
+                player_data[user_id]['first_name'],
+                player_data[user_id]['last_name'],
+                player_data[user_id]['rating']
+            )
+            await message.reply_text("✅ Игрок успешно добавлен!")
+            del player_data[user_id]
 
 
-@app.on_message(filters.command("delete_player"))
-async def delete_player_command(client, message):
-    await message.reply_text("⚠️ Введите имя и фамилию игрока, которого нужно удалить в формате: 'Имя Фамилия'.")
 
-@app.on_message(filters.text)
-async def handle_delete_player_response(client, message):
-    if message.from_user.id != ADMIN_USER_ID:
-        return  # Если не администратор, ничего не делаем
+@app.on_callback_query(filters.regex("delete_player") & filters.user(ADMIN_USER_ID))
+async def delete_player(client, callback_query):
+    players = await fetch_players()
+    keyboard = []
 
-    parts = message.text.split()
-    if len(parts) != 2:
-        await message.reply_text("⚠️ Пожалуйста, укажите имя и фамилию в правильном формате.")
-        return
+    for player in players:
+        keyboard.append([InlineKeyboardButton(f"{player[1]} {player[2]} - Рейтинг: {player[3]}", callback_data=f"confirm_delete_{player[0]}")])
 
-    first_name, last_name = parts
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await callback_query.message.reply_text("Выберите игрока для удаления:", reply_markup=reply_markup)
 
-    # Удаляем игрока из базы данных
-    deleted = await delete_player_from_db(first_name, last_name)
+@app.on_callback_query(filters.regex(r"^confirm_delete_\d+$") & filters.user(ADMIN_USER_ID))
+async def confirm_delete_player(client, callback_query):
+    player_id = int(callback_query.data.split("_")[2])
 
-    if deleted:
-        await message.reply_text(f"✅ Игрок {first_name} {last_name} успешно удален.")
-    else:
-        await message.reply_text(f"❌ Игрок {first_name} {last_name} не найден.")
+    async with aiosqlite.connect('tennis_club.db') as db:
+        await db.execute("DELETE FROM players WHERE id = ?", (player_id,))
+        await db.commit()
 
-@app.on_message(filters.command("admin_menu"))
-async def admin_menu(client, message):
-    if message.from_user.id != ADMIN_USER_ID:
-        await message.reply_text("❗️ У вас нет прав доступа к административному меню.")
-        return
-
-    keyboard = [
-        [InlineKeyboardButton("Добавить турнир", callback_data="add_tournament")],
-        [InlineKeyboardButton("Показать турниры", callback_data="show_tournaments")]
-    ]
-
-    await message.reply_text("🔧 **Админ-панель**", reply_markup=InlineKeyboardMarkup(keyboard))
+    await callback_query.answer("Игрок успешно удален.", show_alert=True)
+    await callback_query.message.delete()
 
 
-app.run()
+@app.on_message(filters.text & filters.user(ADMIN_USER_ID))
+async def handle_input(client, message):
+    user_id = message.from_user.id
+
+    # Обработка изменения рейтинга
+    if user_id in player_data:
+        step = player_data[user_id]['step']
+
+        if step == 'player_id':
+            player_id = message.text
+            player_data[user_id]['player_id'] = player_id
+            player_data[user_id]['step'] = 'new_rating'
+            await message.reply_text("🔍 Введите новый рейтинг игрока:")
+
+        elif step == 'new_rating':
+            new_rating = message.text
+            player_id = player_data[user_id]['player_id']
+
+            # Проверяем, существует ли игрок
+            if await player_exists(player_id):
+                await change_player_rating(player_id, new_rating)
+                await message.reply_text("✅ Рейтинг игрока успешно изменен!")
+            else:
+                await message.reply_text("❌ Игрок с указанным ID не найден.")
+            del player_data[user_id]
+
+            # Смена рейтинга в базе данных
+            await change_player_rating(player_id, new_rating)
+
+            await message.reply_text("✅ Рейтинг игрока успешно изменен!")
+            del player_data[user_id]
+
+
+rating_change_data = {}
+
+@app.on_callback_query(filters.regex("change_rating") & filters.user(ADMIN_USER_ID))
+async def change_rating_callback(client, callback_query):
+    players = await fetch_players()  # Предполагаем, что эта функция возвращает список игроков
+
+    # Формируем сообщение с рейтингом игроков
+    response = "🔍 Выберите игрока для изменения рейтинга:\n"
+    keyboard = []
+
+    for index, player in enumerate(players, start=1):
+        keyboard.append(
+            [InlineKeyboardButton(f"{index}. {player[1]} {player[2]}", callback_data=f"select_player_{player[0]}")])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await callback_query.message.reply_text(response, reply_markup=reply_markup)
+    await callback_query.answer()
+
+
+# Обработчик выбора игрока по нажатию на кнопку
+@app.on_callback_query(filters.regex(r"^select_player_(\d+)$") & filters.user(ADMIN_USER_ID))
+async def select_player_callback(client: Client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    player_id = int(callback_query.data.split('_')[-1])
+
+
+
+if __name__ == "__main__":
+    app.run()
